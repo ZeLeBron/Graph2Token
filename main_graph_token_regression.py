@@ -94,13 +94,13 @@ def main(args):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--filename', type=str, default="graph2token")
+    parser.add_argument('--filename', type=str, default="graph")
     parser.add_argument('--seed', type=int, default=666, help='random seed')
     parser.add_argument('--mode', type=str, default='ft')
     parser.add_argument('--strategy_name', type=str, default=None)
     parser.add_argument('--ckpt_path', type=str, default=None)
     parser = QA_Trainer.add_model_specific_args(parser)  # add model args
-    parser = Stage2CheBIDM.add_model_specific_args(parser)
+    parser = ProcessCheBIDM.add_model_specific_args(parser)
     parser.add_argument('--accelerator', type=str, default='gpu')
     parser.add_argument('--devices', type=str, default='0,1')
     parser.add_argument('--precision', type=str, default='bf16')
