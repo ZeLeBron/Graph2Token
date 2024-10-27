@@ -13,14 +13,15 @@ from torch.cuda.amp import autocast as autocast
 from peft import get_peft_config, get_peft_model, get_peft_model_state_dict, LoraConfig, TaskType, PeftModel
 
 from lavis.models.blip2_models.blip2 import (
+    # Blip2Base,
     disabled_train,
 )
-from torch.nn import MSELoss
+from torch.nn import L1Loss
 from torch_geometric.utils import to_dense_batch
 
-from model.blip2 import Blip2Base
+from model_graph_token_regression.blip2 import Blip2Base
 from transformers import LlamaTokenizer, BitsAndBytesConfig, AutoTokenizer
-from model.modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification
+from model_graph_token_regression.modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification
 
 llama_model_list = [
     "decapoda-research/llama-13b-hf",
@@ -89,7 +90,9 @@ class Blip2Llama(Blip2Base):
         self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<mol>']})
         self.llm_tokenizer.mol_token_id = self.llm_tokenizer("<mol>", add_special_tokens=False).input_ids[0]
 
-        self.llm_model = LlamaForCausalLM.from_pretrained(llm_model, torch_dtype=torch.bfloat16)
+        # self.llm_model = LlamaForCausalLM.from_pretrained(llm_model, torch_dtype=torch.bfloat16)
+        self.llm_model = LlamaForSequenceClassification.from_pretrained(llm_model, torch_dtype=torch.bfloat16)
+
         self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
 
         self.lora_tuning = lora_tuning
@@ -112,9 +115,13 @@ class Blip2Llama(Blip2Base):
         self.eos_token_id = self.llm_tokenizer.eos_token_id
         self.pad_token_id = self.llm_tokenizer.pad_token_id
 
-        self.down_graph_token = nn.Linear(4096, 128)
+        self.word_embeddings = self.llm_model.get_input_embeddings().weight
+        self.vocab_size = self.word_embeddings.shape[0]
+
+        self.mapping = nn.Linear(self.vocab_size + 1, 1)
+        self.down_graph_token = nn.Linear(4096, 256)
         self.activate = nn.ReLU()
-        self.score = self.score = nn.Linear(128, 1, bias=False)
+        self.score = nn.Linear(256, 1, bias=False)
 
         # fixme: no prompt yet
         self.prompt = prompt
@@ -130,39 +137,35 @@ class Blip2Llama(Blip2Base):
         instruction_embeds = self.llm_model.get_input_embeddings()(instruction_tokens.input_ids)
         graph_inputs_llm = h_graph
         graph_inputs_llm = graph_inputs_llm.unsqueeze(1)
-        inputs_embeds = torch.cat([instruction_embeds, graph_inputs_llm], dim=1)
+
+        llama_word_embeddings = self.word_embeddings.unsqueeze(0)
+        llama_word_embeddings = llama_word_embeddings.repeat(
+            graph_inputs_llm.size(0), 1, 1).to(device)
+
+        cat_embedding = torch.cat([graph_inputs_llm, llama_word_embeddings], dim=1)
+        cat_embedding = cat_embedding.permute(0, 2, 1).contiguous()
+        cat_embedding = self.mapping(cat_embedding)
+        cat_embedding = cat_embedding.permute(0, 2, 1).contiguous()
+
+        inputs_embeds = torch.cat([instruction_embeds, cat_embedding], dim=1)
         attention_mask = torch.cat([instruction_tokens.attention_mask, graph_atts_mask], dim=1)
-
-        targets = text_tokens.input_ids.masked_fill(
-            text_tokens.input_ids == self.llm_tokenizer.pad_token_id, -100
-        )
-        empty_targets = (
-            torch.ones(graph_atts_mask.size(), dtype=torch.long).to(device).fill_(-100)
-        )
-        instruct_targets = torch.ones(
-            instruction_tokens.attention_mask.shape, dtype=torch.long).to(device).fill_(-100)
-        targets = torch.cat((instruct_targets, empty_targets, targets), dim=1)
-
-        outputs_embeds = self.llm_model.get_input_embeddings()(text_tokens.input_ids)
-        inputs_embeds = torch.cat([inputs_embeds, outputs_embeds], dim=1)
-        attention_mask = torch.cat([attention_mask, text_tokens.attention_mask], dim=1)
 
         outputs = self.llm_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             return_dict=True,
-            labels=targets,
+            # labels=targets,
             # use_cache=False,
         )
 
         output = outputs.hidden_states
-        graph_token_embedding = output[:, -1, :]
+        graph_token_embedding = output[:, -1, :].unsqueeze(1)
+
         down_graph_token_embedding = self.activate(self.down_graph_token(graph_token_embedding))
         logits = self.score(down_graph_token_embedding)
-        loss_fct = MSELoss()
+        loss_fct = L1Loss()
         loss_mse = loss_fct(logits.squeeze(), text_values.squeeze())
-        loss = outputs.loss + loss_mse
-        return {"loss": loss}
+        return {"loss": loss_mse}
 
     @torch.no_grad()
     def generate(
@@ -202,7 +205,17 @@ class Blip2Llama(Blip2Base):
             instruction_embeds = self.llm_model.get_input_embeddings()(instruction_tokens.input_ids)
             graph_inputs_llm = h_graph
             graph_inputs_llm = graph_inputs_llm.unsqueeze(1)
-            inputs_embeds = torch.cat([instruction_embeds, graph_inputs_llm], dim=1)
+
+            llama_word_embeddings = self.word_embeddings.unsqueeze(0)
+            llama_word_embeddings = llama_word_embeddings.repeat(
+                graph_inputs_llm.size(0), 1, 1).to(h_graph.device)
+
+            cat_embedding = torch.cat([graph_inputs_llm, llama_word_embeddings], dim=1)
+            cat_embedding = cat_embedding.permute(0, 2, 1).contiguous()
+            cat_embedding = self.mapping(cat_embedding)
+            cat_embedding = cat_embedding.permute(0, 2, 1).contiguous()
+
+            inputs_embeds = torch.cat([instruction_embeds, cat_embedding], dim=1)
             attention_mask = torch.cat([instruction_tokens.attention_mask, graph_atts_mask], dim=1)
 
             outputs = self.llm_model(
@@ -213,26 +226,9 @@ class Blip2Llama(Blip2Base):
             )
 
             output = outputs.hidden_states
-            graph_token_embedding = output[:, -1, :]
+            graph_token_embedding = output[:, -1, :].unsqueeze(1)
+
             down_graph_token_embedding = self.activate(self.down_graph_token(graph_token_embedding))
 
-            logits = self.score(down_graph_token_embedding)
-
-            outputs_text_token = self.llm_model.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                do_sample=do_sample,
-                num_beams=num_beams,
-                max_length=max_length,
-                # min_length=min_length,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                pad_token_id=self.pad_token_id,
-                eos_token_id=self.eos_token_id,
-                repetition_penalty=repetition_penalty,
-                length_penalty=length_penalty,
-                num_return_sequences=num_captions,
-            )
-            output_text = self.llm_tokenizer.batch_decode(outputs_text_token, skip_special_tokens=True)
-        output_text = [text.strip() for text in output_text]
-        return output_text, logits
+            logits = self.score(down_graph_token_embedding.squeeze())
+        return logits
