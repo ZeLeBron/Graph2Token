@@ -19,9 +19,9 @@ from lavis.models.blip2_models.blip2 import (
 from torch.nn import L1Loss
 from torch_geometric.utils import to_dense_batch
 
-from model_graph_token_regression.blip2 import Blip2Base
+from model.blip2 import Blip2Base
 from transformers import LlamaTokenizer, BitsAndBytesConfig, AutoTokenizer
-from model_graph_token_regression.modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification
+from model.modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification
 
 llama_model_list = [
     "decapoda-research/llama-13b-hf",
